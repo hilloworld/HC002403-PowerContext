@@ -997,3 +997,83 @@ def test_code_opt_in_preserves_topic_assembly_selection(assembly, expect_topic) 
     assert result.context.content is not None
     assert ("Title topic-1" in result.context.content) is expect_topic
     assert "BEGIN_POWERCONTEXT_CODE_V1" in result.context.content
+
+
+def test_evidence_selection_keeps_exact_cross_scope_addresses() -> None:
+    text = '传感器记录 "37" 度。' + "\u2028" + "测量结果已复核。"
+    hits = (_hit("same", text),)
+    groups = (
+        PreparedMemoryCandidates(scope_id="project:current", memory_ref=MEMORY_REF, hits=hits),
+        PreparedMemoryCandidates(scope_id="project:shared", memory_ref=MEMORY_REF, hits=hits),
+    )
+    builder = PreparedContextBuilder()
+    request = PrepareContextRequest(query="传感器 测量", max_bytes=1200, evidence_selection=True)
+    result = builder.build_scopes_result(
+        request=request,
+        current_scope_id="project:current",
+        memory_candidates=groups,
+    )
+
+    assert result.context.content
+    envelope = json.loads(result.context.content.splitlines()[-2])
+    assert envelope["trust"] == "untrusted_history"
+    assert len(result.fragments) == len(result.origins) == len(envelope["items"]) == 2
+    assert {fragment.address.memory.scope_id for fragment in result.fragments} == {
+        "project:current",
+        "project:shared",
+    }
+    for fragment, origin, item in zip(result.fragments, result.origins, envelope["items"], strict=True):
+        assert origin == fragment.address
+        assert fragment.text == text[fragment.start : fragment.end] == item["content"] == text
+        assert item["citation"]["scope_id"] == fragment.address.memory.scope_id
+        assert item["citation"]["memory_ref"] == MEMORY_REF.model_dump(mode="json")
+    assert result.context.content_bytes == len(result.context.content.encode("utf-8")) <= request.max_bytes
+    probe = builder.probe_budget(
+        request=request,
+        current_scope_id="project:current",
+        memory_candidates=groups,
+    )
+    assert probe.delivered_items == 2
+    assert probe.unused_bytes == request.max_bytes - result.context.content_bytes
+
+
+def test_evidence_selection_can_fit_a_literal_excerpt_when_sentence_is_too_long() -> None:
+    text = "项目背景" * 350 + ' The amber valve opens at "19" degrees.'
+    builder = PreparedContextBuilder()
+    candidates = (PreparedMemoryCandidates(scope_id="scope", memory_ref=MEMORY_REF, hits=(_hit("long", text),)),)
+    request = PrepareContextRequest(query="amber valve", max_bytes=640, evidence_selection=True)
+    result = builder.build_scopes_result(request=request, current_scope_id="scope", memory_candidates=candidates)
+    too_small = builder.build_scopes_result(
+        request=request.model_copy(update={"max_bytes": 512}),
+        current_scope_id="scope",
+        memory_candidates=candidates,
+    )
+
+    assert too_small.context.status == "empty"
+    assert too_small.context.content_bytes == 0
+    assert len(result.fragments) == 1
+    fragment = result.fragments[0]
+    assert fragment.start > 0
+    assert "amber valve" in fragment.text
+    assert fragment.text == text[fragment.start : fragment.end]
+    assert result.context.content_bytes <= request.max_bytes
+
+
+def test_evidence_selection_is_opt_in_and_can_return_empty() -> None:
+    builder = PreparedContextBuilder()
+    request = PrepareContextRequest(query="unrelated", max_bytes=800)
+    candidates = (
+        PreparedMemoryCandidates(scope_id="scope", memory_ref=MEMORY_REF, hits=(_hit("a", "Some old notes."),)),
+    )
+    original = builder.build_scopes_result(request=request, current_scope_id="scope", memory_candidates=candidates)
+    opted_in = builder.build_scopes_result(
+        request=request.model_copy(update={"evidence_selection": True}),
+        current_scope_id="scope",
+        memory_candidates=candidates,
+    )
+
+    assert original.context.status == "ready"
+    assert not original.fragments
+    assert opted_in.context.status == "empty"
+    assert not opted_in.fragments
+    assert not opted_in.origins

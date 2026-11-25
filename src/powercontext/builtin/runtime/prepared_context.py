@@ -34,6 +34,7 @@ from powercontext.builtin.runtime.prepared_code import (
     PreparedCodeCandidate,
     assemble_code,
 )
+from powercontext.builtin.runtime.prepared_evidence import EvidenceSpan, rank_evidence_spans
 from powercontext.builtin.runtime.prepared_text import (
     TRUST_POLICY,
     ContextTextItem,
@@ -106,6 +107,7 @@ class PreparedContextBuild:
     origins: tuple[PreparedContextOrigin, ...]
     omissions: PreparedContextOmissions = PreparedContextOmissions()
     code_origins: tuple[CodeEvidenceRef, ...] = ()
+    fragments: tuple[MemoryEvidenceFragment, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -115,6 +117,16 @@ class MemoryEntryAddress:
     memory: ArtifactAddress
     entry_id: str
     entry_version_id: str
+
+
+@dataclass(frozen=True)
+class MemoryEvidenceFragment:
+    """A literal slice of one exact Memory entry."""
+
+    address: MemoryEntryAddress
+    start: int
+    end: int
+    text: str
 
 
 PreparedContextOrigin = MemoryCitation | ArtifactRef | MemoryEntryAddress | ArtifactAddress
@@ -211,6 +223,9 @@ class PreparedContextBuilder:
         profile_candidates: Sequence[PreparedProfileCandidate] = (),
         code_candidates: Sequence[PreparedCodeCandidate] = (),
     ) -> PreparedContextBuild:
+        if request.evidence_selection:
+            return self._build_evidence(request, current_scope_id, memory_candidates)
+
         if request.include_code:
 
             def historical(history_request: PrepareContextRequest, entries: int) -> PreparedContextBuild:
@@ -256,6 +271,75 @@ class PreparedContextBuilder:
             omissions=omissions,
         )
 
+    def _build_evidence(
+        self,
+        request: PrepareContextRequest,
+        current_scope_id: str | None,
+        memory_candidates: Sequence[PreparedMemoryCandidates],
+    ) -> PreparedContextBuild:
+        if sum(len(group.hits) for group in memory_candidates) > self.memory_candidate_limit:
+            raise PreparedContextInvariantError("memory-candidate-limit")
+
+        sources: dict[tuple[str, str, str, int, str, str], tuple[MemoryEntryAddress, str]] = {}
+        for group in memory_candidates:
+            entries = self._memory_entries(group.memory_ref, group.hits, scope_id=group.scope_id or current_scope_id)
+            for entry in entries:
+                address = entry.origin
+                if not isinstance(address, MemoryEntryAddress):
+                    raise PreparedContextInvariantError("evidence-scope-missing")
+                artifact = address.memory.artifact
+                identity = (
+                    address.memory.scope_id,
+                    artifact.family,
+                    artifact.artifact_id,
+                    artifact.revision,
+                    address.entry_id,
+                    address.entry_version_id,
+                )
+                sources.setdefault(identity, (address, entry.content))
+
+        candidates = tuple(sources.values())
+        spans = rank_evidence_spans(request.query, tuple(text for _, text in candidates))
+        fragments: tuple[MemoryEvidenceFragment, ...] = ()
+        content = ""
+        omitted = 0
+        truncated = 0
+        for span in spans:
+            address, text = candidates[span.entry_index]
+            proposed = _add_evidence_fragment(fragments, address, text, span.start, span.end)
+            rendered = _render_evidence(proposed)
+            if len(rendered.encode("utf-8")) > request.max_bytes:
+                omitted += 1
+                continue
+            fragments, content = proposed, rendered
+
+        # If no full sentence fits, retain a literal excerpt centered on a matching term.
+        if not fragments:
+            for span in spans:
+                address, text = candidates[span.entry_index]
+                fitted = _fit_evidence_excerpt(address, text, span, request.max_bytes)
+                if fitted is not None:
+                    fragment, content = fitted
+                    fragments = (fragment,)
+                    truncated = 1
+                    omitted -= 1
+                    break
+
+        omissions = PreparedContextOmissions(
+            truncated_items=truncated, dropped_items=omitted, dropped_no_fitting_truncation=omitted
+        )
+        context = (
+            PreparedContext(status="ready", content=content, content_bytes=len(content.encode("utf-8")))
+            if fragments
+            else self.empty()
+        )
+        return PreparedContextBuild(
+            context=context,
+            origins=tuple(fragment.address for fragment in fragments),
+            omissions=omissions,
+            fragments=fragments,
+        )
+
     def probe_budget(
         self,
         *,
@@ -277,14 +361,18 @@ class PreparedContextBuilder:
         counters because both go through :meth:`_select_entries`.
         """
 
-        content, origins, omissions = self._select_entries(
-            request=request,
-            current_scope_id=current_scope_id,
-            memory_candidates=memory_candidates,
-            experience_candidates=experience_candidates,
-            profile_candidates=profile_candidates,
-            topic_memory_hits=topic_memory_hits,
-        )
+        if request.evidence_selection:
+            build = self._build_evidence(request, current_scope_id, memory_candidates)
+            content, origins, omissions = build.context.content, build.origins, build.omissions
+        else:
+            content, origins, omissions = self._select_entries(
+                request=request,
+                current_scope_id=current_scope_id,
+                memory_candidates=memory_candidates,
+                experience_candidates=experience_candidates,
+                profile_candidates=profile_candidates,
+                topic_memory_hits=topic_memory_hits,
+            )
         content_bytes = 0 if content is None else len(content.encode("utf-8"))
         return RecallBudgetView(
             max_bytes=request.max_bytes,
@@ -690,8 +778,78 @@ def _render(entries: Sequence[_PreparedContextEntry]) -> str:
         "trust": "untrusted_history",
         "items": [_render_entry(entry) for entry in entries],
     }
-    encoded = json.dumps(envelope, ensure_ascii=False, separators=(",", ":"))
+    return _render_envelope(json.dumps(envelope, ensure_ascii=False, separators=(",", ":")))
+
+
+def _render_envelope(encoded: str) -> str:
     return "\n\n".join((TRUST_POLICY, f"{_BEGIN_MARKER}\n{encoded}\n{_END_MARKER}"))
+
+
+def _render_evidence(fragments: Sequence[MemoryEvidenceFragment]) -> str:
+    items = [
+        {
+            "citation": {
+                "scope_id": fragment.address.memory.scope_id,
+                "memory_ref": fragment.address.memory.artifact.model_dump(mode="json"),
+                "entry_id": fragment.address.entry_id,
+                "entry_version_id": fragment.address.entry_version_id,
+            },
+            "content": fragment.text,
+            "start": fragment.start,
+            "end": fragment.end,
+        }
+        for fragment in fragments
+    ]
+    encoded = json.dumps({"trust": "untrusted_history", "items": items}, ensure_ascii=False, separators=(",", ":"))
+    # Keep the payload on one physical line even when a literal slice contains Unicode line breaks.
+    encoded = encoded.replace("\x85", r"\u0085").replace("\u2028", r"\u2028").replace("\u2029", r"\u2029")
+    return _render_envelope(encoded)
+
+
+def _add_evidence_fragment(
+    fragments: tuple[MemoryEvidenceFragment, ...],
+    address: MemoryEntryAddress,
+    text: str,
+    start: int,
+    end: int,
+) -> tuple[MemoryEvidenceFragment, ...]:
+    """Merge adjacent slices of one entry so they share one citation."""
+    kept: list[MemoryEvidenceFragment] = []
+    position = None
+    for fragment in fragments:
+        gap = text[min(fragment.end, end) : max(fragment.start, start)] if fragment.address == address else None
+        if gap is not None and not gap.strip():
+            if position is None:
+                position = len(kept)
+            start, end = min(start, fragment.start), max(end, fragment.end)
+        else:
+            kept.append(fragment)
+    kept.insert(
+        len(kept) if position is None else position, MemoryEvidenceFragment(address, start, end, text[start:end])
+    )
+    return tuple(kept)
+
+
+def _fit_evidence_excerpt(
+    address: MemoryEntryAddress, text: str, span: EvidenceSpan, max_bytes: int
+) -> tuple[MemoryEvidenceFragment, str] | None:
+    if span.anchor is None:
+        return None
+    anchor_start, anchor_end = span.anchor
+    left, right = 0, max(anchor_start - span.start, span.end - anchor_end)
+    fitted = None
+    while left <= right:
+        radius = (left + right) // 2
+        start = max(span.start, anchor_start - radius)
+        end = min(span.end, anchor_end + radius)
+        fragment = MemoryEvidenceFragment(address, start, end, text[start:end])
+        rendered = _render_evidence((fragment,))
+        if len(rendered.encode("utf-8")) <= max_bytes:
+            fitted = fragment, rendered
+            left = radius + 1
+        else:
+            right = radius - 1
+    return fitted
 
 
 def _text_item(entry: _PreparedContextEntry) -> ContextTextItem:
